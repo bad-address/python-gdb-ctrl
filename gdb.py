@@ -1,21 +1,33 @@
-from byexample.runner import PexpectMixin
-from byexample.options import Options
 from gdb_mi import Output
-import re
 import keyword
 import types
 import pprint
 import sys
+import os
+import pexpect
 
-def create_method(pyname, gdbname, doc):
+def _create_method(pyname, gdbname, doc, silent):
+    ''' Create a method named <pyname> that will
+        invoke the GDB command <gdbname>.
+
+        The <doc> will be used as the documentation of
+        the method.
+
+        The result(s) will be parsed and pretty printed
+        only if <silent> is False
+
+        The last result (if any) will be returned as
+        a Python native object (dictionary).
+        '''
     def x(myself, *args):
         cmd = (gdbname, ) + args
         result, out_of_band = myself.send(' '.join(cmd))
-        for ob in out_of_band:
-            myself._human_print_async(ob)
-            myself._human_print_streams(ob)
-            myself._human_print_result(ob)
-        myself._human_print_result(result)
+        if not silent:
+            for ob in out_of_band:
+                myself._human_print_async(ob)
+                myself._human_print_streams(ob)
+                myself._human_print_result(ob)
+            myself._human_print_result(result)
 
         if result is None:
             return
@@ -31,7 +43,9 @@ def create_method(pyname, gdbname, doc):
 
     return x
 
-def are_tty_colors_supported(output):
+# lovely borrowed from
+# https://github.com/byexamples/byexample
+def _are_tty_colors_supported(output):
     def get_colors():
         try:
             import curses
@@ -44,19 +58,77 @@ def are_tty_colors_supported(output):
            'm' not in os.getenv('TERM', '').split('-') and \
            get_colors() >= 8
 
-import os
-import pexpect
+USE_COLORS = _are_tty_colors_supported(sys.stdout)
+COLOR_PALLET = {'green': 32, 'red': 31, 'yellow': 33, 'cyan': 36}
+
+def _colored(s, color):
+    if USE_COLORS:
+        if color == 'none':
+            return s
+        c = COLOR_PALLET[color]
+        return "\033[%sm%s\033[0m" % (c, s)
+    else:
+        return s
+
 class GDB:
+    ''' Control a GDB instance from Python.
+
+        It handles the initialization of the debugger
+        and its shutdown as well the communication with it.
+
+        To send a command to the debugger, use send() method.
+        It is a blocking operation waiting for GDB to notify
+        that it was 'done'.
+
+        However that doesn't mean that the operation was completed.
+
+        The object(s) read from the debugger can be:
+         - asynchronous notifications and statues
+         - stream output like output from the gdb's console or logs
+         - results from the command executed (or triggered before)
+
+        See the documentation of the send() method.
+
+        If <include_gdb_commands> is 'human', find what commands are
+        available in the debugger and load them as Python methods
+        of this object: you can call them directly without
+        using send().
+
+        This however the methods will print mostly of the object received
+        from them, returning only the last result if any.
+
+        If <include_gdb_commands> is 'machine' it will do the same that
+        before but nothing will be printed.
+
+        If <include_gdb_commands> is 'none' (or None), no method will be
+        created: send() is the only way to communicate with the debugger.
+
+        In general, 'human' is for a small interactive session and 'machine'
+        or 'none' are more for scripting.
+
+        In any case, the last out of band read objects can be read
+        from <last_out_of_band> attribute.
+
+        The debugger will be executed as 'gdb' and needs to be in the PATH.
+        If it isn't, <path2bin> can be specified.
+
+        The same for the 'data directory' with <path2data> (flag --data-directory)
+
+        More flags will be passed:
+            --quite (do not print version on startup)
+            --interpreter=mi (use MI communication protocol)
+
+        If <noinit> is True (default), no configuration file will be loaded
+        by GDB (flags --nh and --nx).
+
+        Extra arguments can be added with <args>.
+        '''
     RESERVED = ('shutdown', 'send')
     def __init__(self, path2bin=None, path2data=None, args=None,
                  encoding='utf-8', noinit=True, geometry=(24,80),
-                 use_colors=None, token_start=87362):
+                 token_start=87362,
+                 include_gdb_commands=None):
         rows, cols = geometry
-
-        if use_colors is None:
-            self._use_colors = are_tty_colors_supported(sys.stdout)
-        else:
-            self._use_colors = use_colors
 
         self._cnt = token_start
 
@@ -93,6 +165,18 @@ class GDB:
         self._mi = Output(nl='\r\n' if with_carriage else '\n')
         self.send('set confirm off')
 
+        if include_gdb_commands not in (None, 'none', 'machine', 'human'):
+            raise ValueError("Invalid include gdb command flag: '%s'" % include_gdb_commands)
+
+        if include_gdb_commands is None or include_gdb_commands == 'none':
+            pass
+        elif include_gdb_commands == 'machine':
+            self._include_gdb_commands(silent=True)
+        elif include_gdb_commands == 'human':
+            self._include_gdb_commands(silent=False)
+        else:
+            assert False
+
 
     def shutdown(self):
         ''' Shutdown the debugger, trying to wake it up and telling it
@@ -125,7 +209,7 @@ class GDB:
 
     def send(self, cmd, console_lines=False):
         # be extra carefully. if we add an extra newline, gdb
-        # will rexecute the last command again.
+        # will re execute the last command again.
         if cmd.endswith('\n'):
             raise ValueError("The command must not end with newline '%s'" % cmd)
 
@@ -158,7 +242,7 @@ class GDB:
         else:
             return result, out_of_band
 
-    def _include_gdb_commands(self):
+    def _include_gdb_commands(self, silent):
         ''' Scan what commands are available in GDB and include them as
             methods.
 
@@ -204,7 +288,7 @@ class GDB:
             tmp.insert(0, 'Command: %s\n\n' % gdbname)
             doc = ''.join(tmp)
 
-            method = create_method(pyname, gdbname, doc)
+            method = _create_method(pyname, gdbname, doc, silent)
 
             setattr(self, pyname, types.MethodType(method, self))
 
@@ -251,7 +335,7 @@ class GDB:
 
         ob = async_result
 
-        self._print(self._colored(ob.type + ':', 'green'), end='')
+        self._print(_colored(ob.type + ':', 'green'), end='')
         s = ob.as_native(include_headers=False)
         self._print(s, fixline=True)
 
@@ -266,7 +350,7 @@ class GDB:
             Ref https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI-Result-Records.html#GDB_002fMI-Result-Records
             '''
         if result is None:
-            self._print(self._colored('None', 'cyan'))
+            self._print(_colored('None', 'cyan'))
             return
 
         if not result.is_result():
@@ -281,7 +365,7 @@ class GDB:
         if r:
             prefix += ':'
 
-        self._print(self._colored(prefix, c), end='' if r else '\n')
+        self._print(_colored(prefix, c), end='' if r else '\n')
 
         if result.is_result(of_class='error'):
             msg = r.pop('msg', '')
@@ -290,12 +374,3 @@ class GDB:
 
         if r:
             self._print(r, fixline=True)
-
-    def _colored(self, s, color):
-        if self._use_colors:
-            if color == 'none':
-                return s
-            c = {'green': 32, 'red': 31, 'yellow': 33, 'cyan': 36}[color]
-            return "\033[%sm%s\033[0m" % (c, s)
-        else:
-            return s
