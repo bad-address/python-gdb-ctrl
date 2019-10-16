@@ -156,13 +156,14 @@ class GDB:
 
         self._gdb.delaybeforesend = None
         self._gdb.delayafterread = None
+        self._gdb.delayafterclose = None
+        self._gdb.delayafterterminate = None
 
         self.last_out_of_band = []
 
         self._gdb.expect(r'\(gdb\) \r?\n') # drop any initial output
-        with_carriage = self._gdb.before.endswith('\r\n')
 
-        self._mi = Output(nl='\r\n' if with_carriage else '\n')
+        self._mi = Output(nl='\n')
         self.send('set confirm off')
 
         if include_gdb_commands not in (None, 'none', 'machine', 'human'):
@@ -207,7 +208,7 @@ class GDB:
         # close this by-hard (if the process is still alive)
         self._gdb.close(force=True)
 
-    def send(self, cmd, console_lines=False):
+    def _send(self, cmd):
         # be extra carefully. if we add an extra newline, gdb
         # will re execute the last command again.
         if cmd.endswith('\n'):
@@ -218,16 +219,25 @@ class GDB:
         self._cnt += 1
 
         self._gdb.send(cmd)
-        self._gdb.expect(r'%s.*\(gdb\) \r?\n' % token)
+        return token
+
+    def send(self, cmd, console_lines=False):
+        self._send(cmd)
 
         tmp = []
-        output = self._gdb.before + self._gdb.match.group(0)
-        for line in output.splitlines(True):
+        r = None
+        while r != '(gdb)':
+            self._gdb.expect(r'\r?\n')
+
+            assert '\n' not in self._gdb.before
+            line = self._gdb.before + '\n'
+
             r = self._mi.parse_line(line)
             tmp.append(r)
 
         if not tmp or tmp[-1] != '(gdb)':
             raise Exception("Missing '(gdb)'")
+
         tmp.pop()
 
         result = None
@@ -241,6 +251,18 @@ class GDB:
             return [s.as_native()['value'] for s in out_of_band if s.is_stream(of_type='Console')]
         else:
             return result, out_of_band
+
+    async def recv(self, handler):
+        while True:
+            ix = await self._gdb.expect([r'\r?\n', pexpect.EOF], async_=True)
+            if ix == 1:
+                break
+
+            assert '\n' not in self._gdb.before
+            line = self._gdb.before + '\n'
+
+            r = self._mi.parse_line(line)
+            await handler(r)
 
     def _include_gdb_commands(self, silent):
         ''' Scan what commands are available in GDB and include them as
