@@ -5,10 +5,11 @@ import pprint
 import sys
 import os
 import pexpect
+import asyncio
 
 def _create_method(pyname, gdbname, doc, silent):
     ''' Create a method named <pyname> that will
-        invoke the GDB command <gdbname>.
+        invoke the gdb command <gdbname>.
 
         The <doc> will be used as the documentation of
         the method.
@@ -21,7 +22,7 @@ def _create_method(pyname, gdbname, doc, silent):
         '''
     def x(myself, *args):
         cmd = (gdbname, ) + args
-        result, out_of_band = myself.send(' '.join(cmd))
+        result, out_of_band = myself.execute(' '.join(cmd))
         if not silent:
             for ob in out_of_band:
                 myself._human_print_async(ob)
@@ -70,67 +71,40 @@ def _colored(s, color):
     else:
         return s
 
-class GDB:
-    ''' Control a GDB instance from Python.
-
-        It handles the initialization of the debugger
-        and its shutdown as well the communication with it.
-
-        To send a command to the debugger, use send() method.
-        It is a blocking operation waiting for GDB to notify
-        that it was 'done'.
-
-        However that doesn't mean that the operation was completed.
-
-        The object(s) read from the debugger can be:
-         - asynchronous notifications and statues
-         - stream output like output from the gdb's console or logs
-         - results from the command executed (or triggered before)
-
-        See the documentation of the send() method.
-
-        If <include_gdb_commands> is 'human', find what commands are
-        available in the debugger and load them as Python methods
-        of this object: you can call them directly without
-        using send().
-
-        This however the methods will print mostly of the object received
-        from them, returning only the last result if any.
-
-        If <include_gdb_commands> is 'machine' it will do the same that
-        before but nothing will be printed.
-
-        If <include_gdb_commands> is 'none' (or None), no method will be
-        created: send() is the only way to communicate with the debugger.
-
-        In general, 'human' is for a small interactive session and 'machine'
-        or 'none' are more for scripting.
-
-        In any case, the last out of band read objects can be read
-        from <last_out_of_band> attribute.
-
-        The debugger will be executed as 'gdb' and needs to be in the PATH.
-        If it isn't, <path2bin> can be specified.
-
-        The same for the 'data directory' with <path2data> (flag --data-directory)
-
-        More flags will be passed:
-            --quite (do not print version on startup)
-            --interpreter=mi (use MI communication protocol)
-
-        If <noinit> is True (default), no configuration file will be loaded
-        by GDB (flags --nh and --nx).
-
-        Extra arguments can be added with <args>.
+class AsyncGDBCtrl:
+    ''' Spawn and control a gdb instance asynchronously, where
+        the spawn(), send(), recv() and shutdown() are coroutines
+        for spawning the debugger, send commands and receive records
+        and shut down the debugger at the end.
         '''
-    RESERVED = ('shutdown', 'send')
-    def __init__(self, path2bin=None, path2data=None, args=None,
-                 encoding='utf-8', noinit=True, geometry=(24,80),
-                 token_start=87362,
-                 include_gdb_commands=None):
-        rows, cols = geometry
+    def __init__(self, token_start=87362):
+        self._cnt = None if token_start is None else token_start
 
-        self._cnt = token_start
+        self.last_out_of_band = []
+        self._mi = Output(nl='\n')
+
+    async def spawn(self, path2bin=None, path2data=None, args=None,
+                 encoding='utf-8', noinit=True, geometry=(24,80)):
+        ''' Spawn the debugger in background.
+
+            The debugger will be executed as 'gdb' and needs to be in the PATH.
+            If it isn't, <path2bin> can be specified.
+
+            The same for the 'data directory' with <path2data> (flag --data-directory)
+
+            More flags will be passed:
+                --quite (do not print version on startup)
+                --interpreter=mi (use MI communication protocol)
+
+            If <noinit> is True (default), no configuration file will be loaded
+            by gdb (flags --nh and --nx).
+
+            Extra arguments for gdb can be added with <args>.
+            '''
+        if hasattr(self, '_gdb'):
+            raise Exception("This GDB Controller already has a gdb instance running.")
+
+        rows, cols = geometry
 
         env = os.environ.copy()
         env.update({'LINES': str(rows), 'COLUMNS': str(cols)})
@@ -152,120 +126,270 @@ class GDB:
                 echo=False,
                 encoding=encoding,
                 dimensions=(rows, cols),
-                env=env)
+                env=env)                    # TODO blocking
 
         self._gdb.delaybeforesend = None
         self._gdb.delayafterread = None
         self._gdb.delayafterclose = None
         self._gdb.delayafterterminate = None
 
-        self.last_out_of_band = []
+        # drop any initial output
+        ix = await self._gdb.expect([r'\(gdb\) \r?\n', pexpect.EOF], async_=True)
+        if ix == 1:
+            raise Exception("Unexpected EOF")
 
-        self._gdb.expect(r'\(gdb\) \r?\n') # drop any initial output
-
-        self._mi = Output(nl='\n')
-        self.send('set confirm off')
-
-        if include_gdb_commands not in (None, 'none', 'machine', 'human'):
-            raise ValueError("Invalid include gdb command flag: '%s'" % include_gdb_commands)
-
-        if include_gdb_commands is None or include_gdb_commands == 'none':
-            pass
-        elif include_gdb_commands == 'machine':
-            self._include_gdb_commands(silent=True)
-        elif include_gdb_commands == 'human':
-            self._include_gdb_commands(silent=False)
-        else:
-            assert False
-
-
-    def shutdown(self):
+    async def shutdown(self):
         ''' Shutdown the debugger, trying to wake it up and telling it
             that we want to quit, nicely. If it doesn't work, kill it
             with SIGKILL.
             '''
+        if self._gdb is None:
+            return
+
         # wake up the debugger (SIGINT)
-        self._gdb.sendintr()
-        time.sleep(0.5)
+        self._gdb.sendintr()                # TODO blocking??
+        await asyncio.sleep(0.5)
 
         # tell it that we want to exit
-        self._gdb.write('-gdb-exit\n')
-        self._gdb.flush()
+        self._gdb.write('-gdb-exit\n')      # TODO blocking
+        self._gdb.flush()                   # TODO blocking
 
         # close the stdin, this is another signal for the
         # debugger that we want to quit
-        self._gdb.sendeof()
+        self._gdb.sendeof()                 # TODO blocking???
 
         # read anything discarding what we read until
         # we get a EOF or a TIMEOUT or the process is dead
         n = 1
         while n:
             try:
-              n = len(self._gdb.read_nonblocking(1024, timeout=5))
+              n = len(self._gdb.read_nonblocking(1024, timeout=5))      # TODO blocking
             except:
               break
 
         # close this by-hard (if the process is still alive)
-        self._gdb.close(force=True)
+        self._gdb.close(force=True)         # TODO blocking??
+        self._gdb = None
 
-    def _send(self, cmd):
+    async def send(self, cmd, token=None):
+        ''' Send the given command to the debugger but do
+            not wait for any response from it. Use recv()
+            for that.
+
+            Keep in mind that recv() receives the next record,
+            no necessary the next 'full response'.
+
+            One send() can trigger several records and asynchronous
+            events in the debugger and in the debuggee can trigger
+            records even without you calling send().
+
+            Each command sent by send() will be prefixed with a
+            token (a number) and return the token to you so you can
+            match the response with recv().
+
+            The token can be explicitly passed with send() or it
+            can be autogenerated (default).
+            The autogeneration can be disabled from AsyncGDBCtrl
+            constructor passing token_start = None.
+            '''
         # be extra carefully. if we add an extra newline, gdb
         # will re execute the last command again.
         if cmd.endswith('\n'):
             raise ValueError("The command must not end with newline '%s'" % cmd)
 
-        token = str(self._cnt)
-        cmd = token + cmd + '\n'
-        self._cnt += 1
+        if token is None:
+            if self._cnt is None:
+                token = ''
+            else:
+                token = str(self._cnt)
+                self._cnt += 1
+        else:
+            token = str(token)
 
-        self._gdb.send(cmd)
+        cmd = token + cmd + '\n'
+        self._gdb.send(cmd)         # TODO blocking
         return token
 
-    def send(self, cmd, console_lines=False):
-        self._send(cmd)
+    async def recv(self):
+        ''' Receive the next asynchronous/synchronous/stream record
+            from the debugger and return it.
+
+            Return None if EOF is hit otherwise return a GDB MI Record.
+
+            There are four types of records in gdb:
+             - AsyncRecord for asynchronous records (events, notifications)
+               that happen so far since the last recv()
+             - ResultRecord for "synchronous" records (results) product
+               of a previous command. Despite the "synchronous" word,
+               a ResultRecord may be the product of an old command so it
+               is more like an asynchronous result.
+             - StreamRecord for logging and gdb's console output that
+               were written since the last recv()
+             - TerminationRecord to mark the end of the response and debugger
+               has the control again and it is accepting new commands.
+               This is the '(gdb)' string.
+
+            References:
+             - https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI-Output-Syntax.html#GDB_002fMI-Output-Syntax
+             - https://pypi.python.org/pypi/python-gdb-mi
+            '''
+        ix = await self._gdb.expect([r'\r?\n', pexpect.EOF], async_=True)
+
+        if ix == 1:
+            return
+
+        assert '\n' not in self._gdb.before
+        line = self._gdb.before + '\n'
+
+        return self._mi.parse_line(line)
+
+
+class GDBCtrl:
+    ''' Spawn and control a gdb instance synchronously, where
+        spawn(), send(), recv() and shutdown() are
+        for spawning the debugger, send commands and receive records
+        and shut down the debugger at the end.
+
+        For convenience, recv_response() receives a full response from
+        gdb consisting of zero or more 'out of bands' records and
+        an optional result record.
+
+        The execute() is a high level method that combines a
+        send() with a recv_response() offering a synchronous way to
+        execute a command and get its result.
+
+        If <interface> is 'human', find what commands are
+        available in the debugger and load them as Python methods
+        of this object: you can call them directly without
+        using execute().
+
+        This however the methods will print mostly of the object received
+        from them, returning only the last result if any.
+
+        If <interface> is 'machine' it will do the same that
+        before but nothing will be printed.
+
+        If <interface> is 'raw', no method will be
+        created: execute() is the only way to communicate with the debugger
+        or using send()/recv()/recv_response().
+
+        In general, 'human' is for a small interactive session and 'machine'
+        or 'none' are more for scripting.
+
+        In any case, after a recv_response() or execute(), the last out of band
+        read objects can be read from <last_out_of_band> attribute.
+        '''
+    def __init__(self, token_start=87362, loop=None):
+        if loop:
+            self._loop = loop
+        else:
+            self._loop = asyncio.get_event_loop()
+
+        self._async_gdb = AsyncGDBCtrl(token_start)
+
+    def _sync_call(self, coro):
+        return self._loop.run_until_complete(coro)
+
+    def spawn(self, path2bin=None, path2data=None, args=None,
+                 encoding='utf-8', noinit=True, geometry=(24,80),
+                 interface='human'):
+        ''' Spawn a gdb instance like AsyncGDBCtrl.spawn() does.
+            In addition, set the 'confirmation off' in gdb and
+            extend the interface of the GDBCtrl instance (self)
+            with gdb commands.
+            '''
+        if interface not in ('raw', 'machine', 'human'):
+            raise ValueError("Invalid interface extension flag: '%s'" % interface)
+
+        self._sync_call(self._async_gdb.spawn(path2bin, path2data,
+                                args, encoding, noinit, geometry))
+
+        self.execute('set confirm off')
+
+        if interface == 'raw':
+            pass
+        elif interface == 'machine':
+            self._extend_interface_with_gdb_commands(silent=True)
+        elif interface == 'human':
+            self._extend_interface_with_gdb_commands(silent=False)
+        else:
+            assert False
+
+        return self
+
+    def shutdown(self):
+        return self._sync_call(self._async_gdb.shutdown())
+
+    def send(self, cmd, token=None):
+        return self._sync_call(self._async_gdb.send(cmd, token))
+
+    def recv(self):
+        return self._sync_call(self._async_gdb.recv())
+
+    def recv_response(self):
+        ''' Receive a full response: zero or more asynchronous
+            "out of band" records followed by an optional result
+            record and terminated with a '(gdb)' termination record.
+
+            Return the 2-tuple with result record (or None) and the
+            list of out of band records (it can be empty).
+
+            If the EOF is hit, return None and any incomplete response
+            is lost.
+            '''
 
         tmp = []
-        r = None
-        while r != '(gdb)':
-            self._gdb.expect(r'\r?\n')
-
-            assert '\n' not in self._gdb.before
-            line = self._gdb.before + '\n'
-
-            r = self._mi.parse_line(line)
+        r = 1
+        while r not in ('(gdb)', None):
+            r = self.recv()
             tmp.append(r)
 
-        if not tmp or tmp[-1] != '(gdb)':
-            raise Exception("Missing '(gdb)'")
+        if not tmp:
+            return None
 
-        tmp.pop()
+        if tmp[-1] != '(gdb)':
+            print("WARN incomplete result; '(gdb)' termination string is missing")
+        else:
+            tmp.pop()
 
         result = None
-        if tmp and tmp[-1].type == 'Sync':
+        if tmp and tmp[-1].is_result():
             result = tmp.pop()
 
         out_of_band = tmp
         self.last_out_of_band = out_of_band
 
+        return result, out_of_band
+
+    def execute(self, cmd, console_lines=False):
+        ''' Execute the given gdb command and wait for its response.
+
+            Combines the functionality of send() and recv_response() and
+            returns the same that recv_response() including None if the
+            EOF is hit.
+
+            At difference with send(), this method requires that the
+            gdb command to be executed generate a result.
+
+            If <console_lines> is True, instead of returning
+            the result and the out of band records, return a list
+            of all the console lines (StreamRecords' values).
+            '''
+        token = self.send(cmd)
+        response = self.recv_response()
+        if response is None:
+            return None
+
+        result, ob = response
+        # TODO loop and accumulate results?
+
         if console_lines:
-            return [s.as_native()['value'] for s in out_of_band if s.is_stream(of_type='Console')]
+            return [s.as_native()['value'] for s in ob if s.is_stream(of_type='Console')]
         else:
-            return result, out_of_band
+            return result, ob
 
-    async def recv(self, handler):
-        while True:
-            ix = await self._gdb.expect([r'\r?\n', pexpect.EOF], async_=True)
-            if ix == 1:
-                break
-
-            assert '\n' not in self._gdb.before
-            line = self._gdb.before + '\n'
-
-            r = self._mi.parse_line(line)
-            await handler(r)
-
-    def _include_gdb_commands(self, silent):
-        ''' Scan what commands are available in GDB and include them as
+    def _extend_interface_with_gdb_commands(self, silent):
+        ''' Scan what commands are available in gdb and include them as
             methods.
 
             This is a best effort: not all the commands will be loaded,
@@ -275,11 +399,11 @@ class GDB:
             The output of each method/command will be processed to be
             more human friendly.
 
-            If you want to interact with GDB directly without any fancy
-            feature, use send().
+            If you want to interact with gdb directly without any fancy
+            feature, use execute().
             '''
         # gdb's output lines result of the apropos command
-        lines = self.send('apropos -*', console_lines=True)
+        lines = self.execute('apropos -*', console_lines=True)
 
         # gdb commands
         gcmds = (l.split('--', 1)[0].strip() for l in lines if '--' in l)
@@ -290,7 +414,7 @@ class GDB:
         # in this case the filtering happens trying to create an alias
         # for the command: if the command doesn't exist the alias creation
         # fails and we filter the command
-        gcmds = filter(lambda ig: self.send('alias -a intwkqjwq%i = %s' % (ig[0], ig[1]))[0].is_result('done'), enumerate(gcmds))
+        gcmds = filter(lambda ig: self.execute('alias -a intwkqjwq%i = %s' % (ig[0], ig[1]))[0].is_result('done'), enumerate(gcmds))
 
         # pythonize the names of the gdb commands
         # => (python-name, gdb-name)
@@ -303,10 +427,11 @@ class GDB:
         # prefix with 'z' if the name is a python keyword or it
         # is a method of GDB class that we don't want to loose
         # => (python-name, gdb-name)
-        meths = (('z' + i[0], i[1]) if keyword.iskeyword(i[0]) or i[0] in GDB.RESERVED else i for i in ids)
+        reserved = [m for m in dir(self) if m[0] != '_']
+        meths = (('z' + i[0], i[1]) if keyword.iskeyword(i[0]) or i[0] in reserved else i for i in ids)
 
         for pyname, gdbname in meths:
-            tmp = self.send('help %s' % gdbname, console_lines=True)
+            tmp = self.execute('help %s' % gdbname, console_lines=True)
             tmp.insert(0, 'Command: %s\n\n' % gdbname)
             doc = ''.join(tmp)
 
