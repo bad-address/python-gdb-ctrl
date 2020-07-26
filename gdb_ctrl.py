@@ -42,6 +42,7 @@ class GDBCtrl:
 
         self._timeout = timeout
         self._mi = Output(nl='\n')
+        self._gdb = None
 
     async def spawn(self, path2bin=None, path2data=None, args=None,
                  encoding='utf-8', noinit=True, geometry=(24,80)):
@@ -64,7 +65,7 @@ class GDBCtrl:
             Once started, gdb is configured to turn off the confirmation of
             some operations so it will not block waiting for a human response.
             '''
-        if hasattr(self, '_gdb'):
+        if self._gdb is not None:
             raise Exception("This GDB Controller already has a gdb instance running.")
 
         rows, cols = geometry
@@ -245,7 +246,7 @@ class SyncGDBCtrl:
         convenient methods to SyncGDBCtrl based on the commands that gdb can
         execute.
         '''
-    def __init__(self, token_start=87362, timeout=1, loop=None):
+    def __init__(self, token_start=87362, timeout=1, loop=None, force_styling=False):
         if loop:
             self._loop = loop
         else:
@@ -254,14 +255,13 @@ class SyncGDBCtrl:
         self._async_gdb = GDBCtrl(token_start, timeout=timeout)
 
         import blessings
-        self._T = blessings.Terminal()
+        self._T = blessings.Terminal(force_styling=force_styling)
 
     def _sync_call(self, coro):
         return self._loop.run_until_complete(coro)
 
     def spawn(self, *args, **kargs):
-        self._sync_call(self._async_gdb.spawn(*args, **kargs))
-        return self
+        return self._sync_call(self._async_gdb.spawn(*args, **kargs))
 
     def shutdown(self):
         return self._sync_call(self._async_gdb.shutdown())
