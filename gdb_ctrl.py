@@ -7,6 +7,7 @@ import os
 import pexpect
 import asyncio
 
+
 def _create_method(pyname, gdbname, doc):
     ''' Create a method named <pyname> that will
         invoke the gdb command <gdbname> using 'execute'.
@@ -25,8 +26,13 @@ def _create_method(pyname, gdbname, doc):
 
     return x
 
+
 def _console_lines(records):
-    return [r.as_native()['value'] for r in records if r.is_stream(of_type='Console')]
+    return [
+        r.as_native()['value'] for r in records
+        if r.is_stream(of_type='Console')
+    ]
+
 
 class GDBCtrl:
     ''' Spawn and control a gdb instance asynchronously, where
@@ -44,8 +50,15 @@ class GDBCtrl:
         self._mi = Output(nl='\n')
         self._gdb = None
 
-    async def spawn(self, path2bin=None, path2data=None, args=None,
-                 encoding='utf-8', noinit=True, geometry=(24,80)):
+    async def spawn(
+        self,
+        path2bin=None,
+        path2data=None,
+        args=None,
+        encoding='utf-8',
+        noinit=True,
+        geometry=(24, 80)
+    ):
         ''' Spawn the debugger in background.
 
             The debugger will be executed as 'gdb' and needs to be in the PATH.
@@ -66,7 +79,9 @@ class GDBCtrl:
             some operations so it will not block waiting for a human response.
             '''
         if self._gdb is not None:
-            raise Exception("This GDB Controller already has a gdb instance running.")
+            raise Exception(
+                "This GDB Controller already has a gdb instance running."
+            )
 
         rows, cols = geometry
 
@@ -79,19 +94,24 @@ class GDBCtrl:
         if path2data is not None:
             args.append("--data-directory=%s" % path2data)
 
-        args.append("--quiet")          # do not print version on startup
+        args.append("--quiet")  # do not print version on startup
         args.append("-interpreter=mi")  # use MI interface mode
 
         if noinit:
-            args.append("--nh")   # do not read ~/.gdbinit.
-            args.append("--nx")   # do not read any .gdbinit files in any directory
+            args.append("--nh")  # do not read ~/.gdbinit.
+            args.append(
+                "--nx"
+            )  # do not read any .gdbinit files in any directory
 
-        self._gdb = pexpect.spawn(cmd, args,
-                echo=False,
-                encoding=encoding,
-                dimensions=(rows, cols),
-                timeout=self._timeout,
-                env=env)                    # TODO blocking
+        self._gdb = pexpect.spawn(
+            cmd,
+            args,
+            echo=False,
+            encoding=encoding,
+            dimensions=(rows, cols),
+            timeout=self._timeout,
+            env=env
+        )  # TODO blocking
 
         self._gdb.delaybeforesend = None
         self._gdb.delayafterread = None
@@ -99,16 +119,19 @@ class GDBCtrl:
         self._gdb.delayafterterminate = None
 
         # drop any initial output
-        ix = await self._gdb.expect([r'\(gdb\) \r?\n', pexpect.EOF], async_=True)
+        ix = await self._gdb.expect(
+            [r'\(gdb\) \r?\n', pexpect.EOF], async_=True
+        )
         if ix == 1:
             raise Exception("Unexpected EOF")
 
         await self.send('set confirm off')
 
-        ix = await self._gdb.expect([r'\(gdb\) \r?\n', pexpect.EOF], async_=True)
+        ix = await self._gdb.expect(
+            [r'\(gdb\) \r?\n', pexpect.EOF], async_=True
+        )
         if ix == 1:
             raise Exception("Unexpected EOF")
-
 
     async def shutdown(self):
         ''' Shutdown the debugger, trying to wake it up and telling it
@@ -119,28 +142,30 @@ class GDBCtrl:
             return
 
         # wake up the debugger (SIGINT)
-        self._gdb.sendintr()                # TODO blocking??
+        self._gdb.sendintr()  # TODO blocking??
         await asyncio.sleep(0.5)
 
         # tell it that we want to exit
-        self._gdb.write('-gdb-exit\n')      # TODO blocking
-        self._gdb.flush()                   # TODO blocking
+        self._gdb.write('-gdb-exit\n')  # TODO blocking
+        self._gdb.flush()  # TODO blocking
 
         # close the stdin, this is another signal for the
         # debugger that we want to quit
-        self._gdb.sendeof()                 # TODO blocking???
+        self._gdb.sendeof()  # TODO blocking???
 
         # read anything discarding what we read until
         # we get a EOF or a TIMEOUT or the process is dead
         n = 1
         while n:
             try:
-              n = len(self._gdb.read_nonblocking(1024, timeout=5))      # TODO blocking
+                n = len(
+                    self._gdb.read_nonblocking(1024, timeout=5)
+                )  # TODO blocking
             except:
-              break
+                break
 
         # close this by-hard (if the process is still alive)
-        self._gdb.close(force=True)         # TODO blocking??
+        self._gdb.close(force=True)  # TODO blocking??
         self._gdb = None
 
     async def send(self, cmd, token=None):
@@ -169,7 +194,9 @@ class GDBCtrl:
         # be extra carefully. if we add an extra newline, gdb
         # will re execute the last command again.
         if cmd.endswith('\n'):
-            raise ValueError("The command must not end with newline '%s'" % cmd)
+            raise ValueError(
+                "The command must not end with newline '%s'" % cmd
+            )
 
         if token is None:
             if self._cnt is None:
@@ -181,7 +208,7 @@ class GDBCtrl:
             token = str(token)
 
         cmd = token + cmd + '\n'
-        self._gdb.send(cmd)         # TODO blocking
+        self._gdb.send(cmd)  # TODO blocking
         return token
 
     async def recv(self, timeout=-1):
@@ -227,6 +254,7 @@ class GDBCtrl:
 
         return self._mi.parse_line(line)
 
+
 class SyncGDBCtrl:
     ''' Spawn and control a gdb instance synchronously, where
         spawn(), send(), recv() and shutdown() are
@@ -246,7 +274,9 @@ class SyncGDBCtrl:
         convenient methods to SyncGDBCtrl based on the commands that gdb can
         execute.
         '''
-    def __init__(self, token_start=87362, timeout=1, loop=None, force_styling=False):
+    def __init__(
+        self, token_start=87362, timeout=1, loop=None, force_styling=False
+    ):
         if loop:
             self._loop = loop
         else:
@@ -280,10 +310,12 @@ class SyncGDBCtrl:
             session so it will pretty print the records by default.
             (disable this with <pretty_print> set to False)
             '''
-        if timeout is None or (timeout == -1 and self._async_gdb._timeout is None):
+        if timeout is None or (
+            timeout == -1 and self._async_gdb._timeout is None
+        ):
             end_set = ('(gdb)', None)
         else:
-            end_set = (None,)
+            end_set = (None, )
 
         tmp = []
         r = 1
@@ -344,11 +376,18 @@ class SyncGDBCtrl:
         # in this case the filtering happens trying to create an alias
         # for the command: if the command doesn't exist the alias creation
         # fails and we filter the command
-        gcmds = filter(lambda ig: self._execute('alias -a intwkqjwq%i = %s' % (ig[0], ig[1]), timeout=None)[-1].is_result('done'), enumerate(gcmds))
+        gcmds = filter(
+            lambda ig: self._execute(
+                'alias -a intwkqjwq%i = %s' % (ig[0], ig[1]), timeout=None
+            )[-1].is_result('done'), enumerate(gcmds)
+        )
 
         # pythonize the names of the gdb commands
         # => (python-name, gdb-name)
-        names = ((c.strip().replace(' ', '_').replace('-', '_'), c) for _, c in gcmds)
+        names = (
+            (c.strip().replace(' ', '_').replace('-', '_'), c)
+            for _, c in gcmds
+        )
 
         # discard any name that is not valid as a python method
         # => (python-name, gdb-name)
@@ -358,7 +397,11 @@ class SyncGDBCtrl:
         # is a method of GDB class that we don't want to loose
         # => (python-name, gdb-name)
         reserved = [m for m in dir(self) if m[0] != '_']
-        meths = (('z' + i[0], i[1]) if keyword.iskeyword(i[0]) or i[0] in reserved else i for i in ids)
+        meths = (
+            ('z' + i[0],
+             i[1]) if keyword.iskeyword(i[0]) or i[0] in reserved else i
+            for i in ids
+        )
 
         for pyname, gdbname in meths:
             tmp = self._execute('help %s' % gdbname, timeout=None)
@@ -378,7 +421,7 @@ class SyncGDBCtrl:
         else:
             assert len(args) == 1
             s = args[0]
-            if not isinstance(s, (str,bytes)):
+            if not isinstance(s, (str, bytes)):
                 s = pprint.pformat(s)
             if '\n' in s:
                 print('\n', s, sep='')
@@ -399,7 +442,6 @@ class SyncGDBCtrl:
             self._print(s.rstrip())
         elif stream.is_stream(of_type='Log'):
             pass
-
 
     def _human_print_async(self, async_result):
         ''' From the GDB MI's documentation:
@@ -438,12 +480,12 @@ class SyncGDBCtrl:
             return
 
         c = {
-                'error': T.red,
-                'done': T.cyan,
-                'running': T.yellow,
-                'connected': T.yellow,
-                'exit': T.yellow
-                }.get(result.result_class, T.normal)
+            'error': T.red,
+            'done': T.cyan,
+            'running': T.yellow,
+            'connected': T.yellow,
+            'exit': T.yellow
+        }.get(result.result_class, T.normal)
 
         r = result.as_native(include_headers=False)
         prefix = result.result_class.capitalize()
