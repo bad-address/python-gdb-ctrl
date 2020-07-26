@@ -1,2 +1,5 @@
 example/glad
 __pycache__/
+README.rst
+*.egg-info/
+dist/
